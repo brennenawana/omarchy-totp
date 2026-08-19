@@ -1,0 +1,361 @@
+// Standalone test harness for Store.js. Run with: node test/store.js
+//
+// Store.js is a QML JS library: it opens with `.pragma library` and pulls in
+// Totp.js with the QML `.import` directive. Both are stripped here and Totp is
+// supplied as a namespace object, so the shipped files carry no test scaffolding.
+
+const fs = require("fs")
+const path = require("path")
+
+function loadLibrary(file, exportNames, injected = {}) {
+  const source = fs
+    .readFileSync(path.join(__dirname, "..", file), "utf8")
+    .replace(/^\.pragma library\s*/, "")
+    .replace(/^\.import\s+.*$/gm, "")
+
+  const scope = {}
+  const names = Object.keys(injected)
+  new Function(...names, "exports",
+    source + "\n;Object.assign(exports, {" + exportNames.join(",") + "});"
+  )(...names.map((n) => injected[n]), scope)
+  return scope
+}
+
+const Totp = loadLibrary("Totp.js",
+  ["totp", "hotp", "base32Decode", "secondsRemaining", "normalizeAlgorithm"])
+
+const S = loadLibrary("Store.js", [
+  "cleanText", "isBlank", "splitUri", "splitLabel", "parseOtpauth",
+  "normalizeAccount", "newId", "toRecord", "parseIndex", "serializeIndex",
+  "matches", "groupCode", "toOtpauth", "buildExport", "parseExport"
+], { Totp })
+
+let failures = 0
+
+function check(name, actual, expected) {
+  const ok = String(actual) === String(expected)
+  if (!ok) failures++
+  console.log(`${ok ? "  ok  " : "FAIL  "}${name}` +
+    (ok ? "" : `\n        expected ${expected}\n        actual   ${actual}`))
+}
+
+function rejects(name, fn, expectedMessage) {
+  let message = null
+  try { fn() } catch (e) { message = e.message }
+  if (expectedMessage === undefined) {
+    check(name, message === null ? "accepted" : "rejected", "rejected")
+  } else {
+    check(name, message, expectedMessage)
+  }
+}
+
+const SEED = "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ"
+
+// --- otpauth:// parsing ----------------------------------------------------
+
+console.log("\notpauth:// parsing")
+{
+  const a = S.parseOtpauth(
+    `otpauth://totp/GitHub:sasiru?secret=${SEED}&issuer=GitHub&digits=6&period=30`)
+  check("label", a.label, "sasiru")
+  check("issuer", a.issuer, "GitHub")
+  check("digits", a.digits, 6)
+  check("period", a.period, 30)
+  check("algorithm", a.algorithm, "SHA1")
+  check("secret", a.secret, SEED)
+}
+
+{
+  // Percent-encoded label: "ACME Co:alice@acme.com"
+  const a = S.parseOtpauth(
+    `otpauth://totp/ACME%20Co:alice%40acme.com?secret=${SEED}`)
+  check("decodes %20 in issuer", a.issuer, "ACME Co")
+  check("decodes %40 in label", a.label, "alice@acme.com")
+}
+
+{
+  // No issuer= parameter: the label prefix supplies it.
+  const a = S.parseOtpauth(`otpauth://totp/Proton:me?secret=${SEED}`)
+  check("issuer from label prefix", a.issuer, "Proton")
+  check("account after prefix", a.label, "me")
+}
+
+{
+  // issuer= disagrees with the label prefix; the parameter wins.
+  const a = S.parseOtpauth(`otpauth://totp/Old:me?secret=${SEED}&issuer=New`)
+  check("issuer parameter wins", a.issuer, "New")
+}
+
+{
+  const a = S.parseOtpauth(`otpauth://totp/BareName?secret=${SEED}`)
+  check("bare label, no issuer", a.label, "BareName")
+  check("issuer empty", a.issuer, "")
+}
+
+{
+  const a = S.parseOtpauth(
+    `otpauth://TOTP/X?secret=${SEED}&algorithm=SHA256&digits=8&period=60`)
+  check("uppercase scheme type", a.algorithm, "SHA256")
+  check("digits honoured", a.digits, 8)
+  check("period honoured", a.period, 60)
+}
+
+// The label prefix may be padded after the colon; that space is not part of
+// the account name.
+check("trims space after colon",
+  S.parseOtpauth(`otpauth://totp/Iss:%20name?secret=${SEED}`).label, "name")
+check("trims an encoded space after the colon",
+  S.parseOtpauth(`otpauth://totp/Iss:%20%20name?secret=${SEED}`).label, "name")
+
+// The issuer/account separator may be written literally or percent-encoded.
+{
+  const a = S.parseOtpauth(`otpauth://totp/ACME%3Aalice?secret=${SEED}`)
+  check("accepts %3A as the separator", a.issuer, "ACME")
+  check("account after an encoded separator", a.label, "alice")
+}
+
+// Splitting happens on the raw path, before decoding. An encoded slash is
+// therefore just a character in the account name, never a path boundary.
+check("an encoded slash stays in the name",
+  S.parseOtpauth(`otpauth://totp/a%2Fb?secret=${SEED}`).label, "a/b")
+
+// Only the FIRST separator splits; later colons belong to the account name.
+{
+  const a = S.parseOtpauth(`otpauth://totp/Iss:a:b?secret=${SEED}`)
+  check("splits on the first colon only", a.issuer, "Iss")
+  check("later colons stay in the name", a.label, "a:b")
+}
+
+console.log("\notpauth:// rejection")
+rejects("rejects a plain string", () => S.parseOtpauth("hello"),
+  "Not an otpauth:// link")
+rejects("rejects http:// links", () => S.parseOtpauth("https://example.com"),
+  "Not an otpauth:// link")
+rejects("rejects hotp", () => S.parseOtpauth(`otpauth://hotp/X?secret=${SEED}&counter=1`),
+  "Counter-based (HOTP) codes are not supported")
+rejects("rejects unknown type", () => S.parseOtpauth(`otpauth://yotp/X?secret=${SEED}`))
+rejects("rejects a missing secret", () => S.parseOtpauth("otpauth://totp/X"),
+  "A secret is required")
+rejects("rejects a non-base32 secret", () => S.parseOtpauth("otpauth://totp/X?secret=nope!!"),
+  "That secret is not valid base32")
+rejects("rejects an empty name", () => S.parseOtpauth(`otpauth://totp/?secret=${SEED}`),
+  "A name is required")
+
+// A malformed percent-escape must not take the whole enrolment down with it.
+check("survives a broken escape",
+  S.parseOtpauth(`otpauth://totp/100%pure?secret=${SEED}`).label, "100%pure")
+
+// --- field validation ------------------------------------------------------
+
+console.log("\nField validation")
+rejects("rejects 5 digits", () => S.normalizeAccount({ label: "x", secret: SEED, digits: 5 }),
+  "Digits must be 6, 7, or 8")
+rejects("rejects 9 digits", () => S.normalizeAccount({ label: "x", secret: SEED, digits: 9 }),
+  "Digits must be 6, 7, or 8")
+rejects("rejects period 0", () => S.normalizeAccount({ label: "x", secret: SEED, period: 0 }),
+  "Period must be between 1 and 300 seconds")
+rejects("rejects period 301", () => S.normalizeAccount({ label: "x", secret: SEED, period: 301 }),
+  "Period must be between 1 and 300 seconds")
+rejects("rejects MD5", () => S.normalizeAccount({ label: "x", secret: SEED, algorithm: "MD5" }),
+  "Unsupported algorithm: MD5")
+check("accepts 7 digits",
+  S.normalizeAccount({ label: "x", secret: SEED, digits: 7 }).digits, 7)
+check("accepts sha-512 spelling",
+  S.normalizeAccount({ label: "x", secret: SEED, algorithm: "sha-512" }).algorithm, "SHA512")
+check("strips spaces from a pasted secret",
+  S.normalizeAccount({ label: "x", secret: "JBSW Y3DP EHPK 3PXP" }).secret, "JBSWY3DPEHPK3PXP")
+
+// --- untrusted text --------------------------------------------------------
+
+console.log("\nUntrusted text")
+{
+  // Markup is kept verbatim rather than escaped or stripped. Rendering safety
+  // is the UI's job (Text.PlainText) — mangling the label here would only hide
+  // the problem while leaving other sinks exposed.
+  const hostile = '<img src=x onerror=alert(1)>'
+  const a = S.parseOtpauth(
+    `otpauth://totp/${encodeURIComponent(hostile)}?secret=${SEED}`)
+  check("markup preserved verbatim", a.label, hostile)
+
+  // Same payload in the issuer= parameter, which takes a different code path.
+  const b = S.parseOtpauth(
+    `otpauth://totp/name?secret=${SEED}&issuer=${encodeURIComponent(hostile)}`)
+  check("markup in issuer= preserved", b.issuer, hostile)
+}
+check("strips newlines", S.cleanText("a\nb"), "ab")
+check("strips carriage returns", S.cleanText("a\r\nb"), "ab")
+check("strips NUL", S.cleanText("a\u0000b"), "ab")
+check("strips DEL", S.cleanText("a\u007fb"), "ab")
+check("trims surrounding space", S.cleanText("  spaced  "), "spaced")
+check("caps length at 128", S.cleanText("z".repeat(500)).length, 128)
+check("handles null", S.cleanText(null), "")
+check("handles undefined", S.cleanText(undefined), "")
+{
+  // A label that is nothing but control characters cannot name an account.
+  rejects("rejects an all-control label",
+    () => S.normalizeAccount({ label: "\n\r ", secret: SEED }), "A name is required")
+}
+
+// --- the index file --------------------------------------------------------
+
+console.log("\nIndex file")
+{
+  const account = S.normalizeAccount({ label: "GitHub", issuer: "GitHub", secret: SEED })
+  const record = S.toRecord("abc123", account)
+  check("record keeps the id", record.id, "abc123")
+  check("record has no secret field", record.secret, "undefined")
+  check("record field count", Object.keys(record).length, 6)
+
+  const json = S.serializeIndex([Object.assign({ id: "abc123" }, account)])
+  // The single most important assertion in this file.
+  check("serialized index omits the secret", json.indexOf(SEED) < 0, "true")
+  check("serialized index omits 'secret'", json.indexOf("secret") < 0, "true")
+  check("serialized index round-trips", S.parseIndex(json).length, 1)
+  check("round-trip keeps the label", S.parseIndex(json)[0].label, "GitHub")
+}
+
+console.log("\nIndex file: hostile and corrupt input")
+check("corrupt JSON yields no accounts", S.parseIndex("{not json").length, 0)
+check("empty string yields no accounts", S.parseIndex("").length, 0)
+check("null yields no accounts", S.parseIndex(null).length, 0)
+check("missing accounts key yields none", S.parseIndex('{"version":1}').length, 0)
+check("non-object rows are skipped",
+  S.parseIndex('{"accounts":[1,"two",null]}').length, 0)
+check("rows without a usable id are skipped",
+  S.parseIndex('{"accounts":[{"label":"x"}]}').length, 0)
+check("path-traversal ids are skipped",
+  S.parseIndex('{"accounts":[{"id":"../../etc/passwd","label":"x"}]}').length, 0)
+check("ids with slashes are skipped",
+  S.parseIndex('{"accounts":[{"id":"a/b","label":"x"}]}').length, 0)
+check("overlong ids are skipped",
+  S.parseIndex(`{"accounts":[{"id":"${"a".repeat(65)}","label":"x"}]}`).length, 0)
+check("duplicate ids collapse to the first",
+  S.parseIndex('{"accounts":[{"id":"a","label":"first"},{"id":"a","label":"second"}]}')[0].label,
+  "first")
+check("out-of-range digits fall back to 6",
+  S.parseIndex('{"accounts":[{"id":"a","label":"x","digits":99}]}')[0].digits, 6)
+check("out-of-range period falls back to 30",
+  S.parseIndex('{"accounts":[{"id":"a","label":"x","period":-5}]}')[0].period, 30)
+check("unknown algorithm falls back to SHA1",
+  S.parseIndex('{"accounts":[{"id":"a","label":"x","algorithm":"md5"}]}')[0].algorithm, "SHA1")
+check("a label-less row falls back to its id",
+  S.parseIndex('{"accounts":[{"id":"a"}]}')[0].label, "a")
+{
+  // An index written by a buggy build might carry a secret. Reading it must
+  // not carry that secret forward into the running plugin.
+  const loaded = S.parseIndex(`{"accounts":[{"id":"a","label":"x","secret":"${SEED}"}]}`)
+  check("a stray secret in the index is dropped", loaded[0].secret, "undefined")
+  check("re-serializing does not reintroduce it",
+    S.serializeIndex(loaded).indexOf(SEED) < 0, "true")
+}
+
+// --- ids -------------------------------------------------------------------
+
+console.log("\nIds")
+{
+  const ids = new Set()
+  for (let i = 0; i < 2000; i++) ids.add(S.newId([]))
+  check("2000 ids are unique", ids.size, 2000)
+  check("id shape is index-safe", /^[A-Za-z0-9._-]{1,64}$/.test(S.newId([])), "true")
+
+  const taken = S.newId([])
+  check("avoids ids already in use", S.newId([taken]) === taken, "false")
+}
+
+// --- display helpers -------------------------------------------------------
+
+console.log("\nDisplay helpers")
+check("groups 6 digits", S.groupCode("482913"), "482 913")
+check("groups 7 digits", S.groupCode("4829134"), "4829 134")
+check("groups 8 digits", S.groupCode("48291340"), "4829 1340")
+check("leaves an empty code alone", S.groupCode(""), "")
+
+const row = { label: "alice@acme.com", issuer: "ACME" }
+check("matches on label", S.matches(row, "alice"), "true")
+check("matches on issuer", S.matches(row, "acme"), "true")
+check("match is case-insensitive", S.matches(row, "ACME"), "true")
+check("empty query matches everything", S.matches(row, "  "), "true")
+check("non-match is rejected", S.matches(row, "github"), "false")
+
+// --- export round-trip ------------------------------------------------------
+
+console.log("\nExport")
+{
+  const account = S.normalizeAccount({ label: "alice@acme.com", issuer: "ACME Co", secret: SEED })
+  const link = S.toOtpauth(S.toRecord("x", account), account.secret)
+  check("link is an otpauth totp url", link.indexOf("otpauth://totp/") === 0, "true")
+  check("issuer and label are encoded",
+    link.indexOf("ACME%20Co:alice%40acme.com") > 0, "true")
+
+  // The whole point: what comes out must parse back to what went in.
+  const back = S.parseOtpauth(link)
+  check("round-trip label", back.label, account.label)
+  check("round-trip issuer", back.issuer, account.issuer)
+  check("round-trip secret", back.secret, account.secret)
+  check("round-trip digits", back.digits, account.digits)
+  check("round-trip period", back.period, account.period)
+  check("round-trip algorithm", back.algorithm, account.algorithm)
+}
+
+{
+  // Non-default parameters have to survive too, or a restore silently
+  // downgrades an 8-digit SHA-512 account to a 6-digit SHA-1 one and every
+  // code it produces is wrong.
+  const odd = S.normalizeAccount({
+    label: "eight", issuer: "Odd", secret: SEED,
+    digits: 8, period: 60, algorithm: "SHA512"
+  })
+  const back = S.parseOtpauth(S.toOtpauth(S.toRecord("y", odd), odd.secret))
+  check("round-trip 8 digits", back.digits, 8)
+  check("round-trip 60s period", back.period, 60)
+  check("round-trip SHA512", back.algorithm, "SHA512")
+}
+
+{
+  // A name containing the separator must not split differently on the way back.
+  const tricky = S.normalizeAccount({ label: "a:b", issuer: "Iss:uer", secret: SEED })
+  const back = S.parseOtpauth(S.toOtpauth(S.toRecord("z", tricky), tricky.secret))
+  check("colon in the account name survives", back.label, "a:b")
+  check("colon in the issuer survives", back.issuer, "Iss:uer")
+}
+
+{
+  const records = [
+    S.toRecord("a", S.normalizeAccount({ label: "one", issuer: "One", secret: SEED })),
+    S.toRecord("b", S.normalizeAccount({ label: "two", issuer: "Two", secret: "JBSWY3DPEHPK3PXP" }))
+  ]
+  const secrets = { a: SEED, b: "JBSWY3DPEHPK3PXP" }
+  const out = S.buildExport(records, (id) => secrets[id])
+  check("exported both accounts", out.exported, 2)
+  check("nothing was missing", out.missing, 0)
+  check("export carries both secrets",
+    out.text.indexOf(SEED) > 0 && out.text.indexOf("JBSWY3DPEHPK3PXP") > 0, "true")
+
+  const restored = S.parseExport(out.text)
+  check("restore found both", restored.accounts.length, 2)
+  check("restore had no errors", restored.errors.length, 0)
+  check("restore keeps the first label", restored.accounts[0].label, "one")
+  check("restore keeps the second secret", restored.accounts[1].secret, "JBSWY3DPEHPK3PXP")
+
+  // An account whose secret could not be read must be counted, not dropped
+  // silently — the user has to know the export is incomplete.
+  const partial = S.buildExport(records, (id) => (id === "a" ? SEED : ""))
+  check("unreadable secret is counted", partial.missing, 1)
+  check("unreadable secret is not exported", partial.exported, 1)
+}
+
+console.log("\nRestore: comments and damage")
+check("comments are skipped",
+  S.parseExport("# a comment\n\n" + S.toOtpauth(
+    S.toRecord("q", S.normalizeAccount({ label: "n", secret: SEED })), SEED)).accounts.length, 1)
+check("a damaged line is reported",
+  S.parseExport("otpauth://totp/x?secret=!!!").errors.length, 1)
+check("a damaged line does not abort the rest",
+  S.parseExport("garbage\n" + S.toOtpauth(
+    S.toRecord("q", S.normalizeAccount({ label: "n", secret: SEED })), SEED)).accounts.length, 1)
+check("an empty export restores nothing", S.parseExport("").accounts.length, 0)
+
+console.log(failures === 0
+  ? "\nAll checks passed.\n"
+  : `\n${failures} check(s) FAILED.\n`)
+process.exit(failures === 0 ? 0 : 1)
