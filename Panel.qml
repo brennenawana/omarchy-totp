@@ -278,7 +278,11 @@ Panel {
   function scanQr() {
     root.formError = ""
     root.close()
-    scanner.running = true
+    // The popup and its full-screen dismiss layer have to be gone before the
+    // screenshot is taken, or the panel photographs itself sitting on top of
+    // the code — and the region selector comes up fighting a surface that is
+    // still animating away.
+    scanDelay.restart()
   }
 
   implicitWidth: button.implicitWidth
@@ -355,6 +359,12 @@ Panel {
   }
 
   Timer {
+    id: scanDelay
+    interval: 350
+    onTriggered: scanner.running = true
+  }
+
+  Timer {
     id: typeDelay
     interval: 220
     onTriggered: {
@@ -390,8 +400,19 @@ Panel {
     }
   }
 
-  // Grabs a screen region and decodes a QR code out of it. The popup closes
-  // first: it would otherwise sit on top of the very code being scanned.
+  // Finds a QR code on screen and reads the otpauth:// link out of it. No
+  // camera is involved: this photographs the screen, which is where the code
+  // actually is when a website is walking you through setup.
+  //
+  // The whole screen is scanned first. Asking someone to drag a box around a
+  // code the machine can already see is work for nothing, and the selector
+  // appearing over a browser is exactly when it is most fiddly. The region
+  // selector is the fallback for when the full screen yields nothing — several
+  // codes on screen at once, or one too small to resolve.
+  //
+  // Codes that are not otpauth:// links are skipped rather than taken and
+  // rejected later, so an unrelated QR sharing the screen cannot swallow the
+  // attempt.
   //
   // The script is a constant with no interpolation, and the decoded link is
   // read from stdout and parsed as data — it never re-enters a shell.
@@ -399,9 +420,19 @@ Panel {
     id: scanner
     property string result: ""
 
-    command: ["sh", "-c",
-      "grim -g \"$(slurp -b 00000080 -w 2)\" - | " +
-      "zbarimg --raw -q -1 -Sdisable -Sqrcode.enable -"]
+    command: ["bash", "-c",
+      "scan() { " +
+      "  if [ -n \"$1\" ]; then grim -g \"$1\" -; else grim -; fi " +
+      "  | zbarimg --raw -q -Sdisable -Sqrcode.enable - 2>/dev/null " +
+      "  | grep -m1 -i '^otpauth://'; " +
+      "}; " +
+      "found=$(scan) || true; " +
+      "if [ -z \"$found\" ]; then " +
+      "  geometry=$(slurp -b 00000080 -w 2) || exit 3; " +
+      "  found=$(scan \"$geometry\") || true; " +
+      "fi; " +
+      "[ -n \"$found\" ] || exit 4; " +
+      "printf %s \"$found\""]
 
     stdout: StdioCollector {
       waitForEnd: true
@@ -414,8 +445,12 @@ Panel {
       result = ""
       root.open()
       if (link.length === 0) {
-        root.flash("No QR code found in that selection")
         root.view = "add"
+        // 3 is a cancelled selection, which needs no complaint; anything else
+        // means we looked and found nothing usable.
+        root.formError = code === 3 ? ""
+          : "No two-factor QR code found on screen. Make sure it is visible, "
+          + "then try again."
         return
       }
       if (!root.submitLink(link)) {

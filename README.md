@@ -27,9 +27,12 @@ omarchy bar move io.github.sasirulk.totp --section center
 
 Click the bar icon, then **Add**:
 
-- **Scan a QR code on screen** — drag a box around the QR code on the site's
-  two-factor setup page. This reads a region of your screen, not a camera, so
-  it works on any machine.
+- **Scan a QR code on screen** — leave the site's two-factor setup page open
+  and pick this. It photographs your screen, not a camera, so it works on any
+  machine, laptops included. Usually there is nothing to do: it reads the whole
+  screen, finds the code and adds the account. Only if that turns up nothing —
+  several QR codes on screen at once, or one too small to resolve — does it ask
+  you to drag a box around the right one.
 - **Paste an otpauth:// link** — for sites that offer the link instead of, or
   as well as, a QR code.
 - **Enter a secret by hand** — for the "can't scan it?" fallback key. Defaults
