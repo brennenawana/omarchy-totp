@@ -157,6 +157,9 @@ Panel {
   }
 
   property bool linkVisible: false
+  // True from the moment a scan starts until it resolves, so the panel can say
+  // that something is happening rather than just closing.
+  property bool scanning: false
 
   function beginAdd() {
     root.formError = ""
@@ -275,13 +278,25 @@ Panel {
     return true
   }
 
+  // Scanning happens in up to three steps, cheapest first.
+  //
+  // 1. Photograph the screen with the popup still open. The popup is a small
+  //    card in one corner and the code is usually nowhere near it, so this
+  //    normally succeeds — and because nothing closes, there is no moment
+  //    where the panel has vanished and you are left wondering whether
+  //    anything is happening.
+  // 2. If that finds nothing, the popup might be covering the code. Close it,
+  //    let it finish animating away, and look again.
+  // 3. Only if that also fails ask for a region, which is the answer to
+  //    several codes on screen at once or one too small to resolve.
   function scanQr() {
     root.formError = ""
+    root.scanning = true
+    quickScanner.running = true
+  }
+
+  function scanWithPanelHidden() {
     root.close()
-    // The popup and its full-screen dismiss layer have to be gone before the
-    // screenshot is taken, or the panel photographs itself sitting on top of
-    // the code — and the region selector comes up fighting a surface that is
-    // still animating away.
     scanDelay.restart()
   }
 
@@ -300,6 +315,7 @@ Panel {
       root.cursorActive = false
       root.listIndex = 0
       root.linkVisible = false
+      root.scanning = scanner.running || quickScanner.running
       searchField.text = ""
       vault.reload()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
@@ -416,6 +432,35 @@ Panel {
   //
   // The script is a constant with no interpolation, and the decoded link is
   // read from stdout and parsed as data — it never re-enters a shell.
+  // Step 1. Same decode as the full scanner, but no region selector and no
+  // closing of the popup, so it can be tried before disturbing anything.
+  Process {
+    id: quickScanner
+    property string result: ""
+
+    command: ["bash", "-c",
+      "grim - | zbarimg --raw -q -Sdisable -Sqrcode.enable - 2>/dev/null " +
+      "| grep -m1 -i '^otpauth://'"]
+
+    stdout: StdioCollector {
+      waitForEnd: true
+      onStreamFinished: quickScanner.result = text
+    }
+    stderr: StdioCollector { waitForEnd: true }
+
+    onExited: function(code) {
+      var link = result.trim()
+      result = ""
+      if (link.length === 0) {
+        // Nothing visible from here; the popup may be in the way.
+        root.scanWithPanelHidden()
+        return
+      }
+      root.scanning = false
+      if (!root.submitLink(link)) root.flash(root.formError)
+    }
+  }
+
   Process {
     id: scanner
     property string result: ""
@@ -443,13 +488,14 @@ Panel {
     onExited: function(code) {
       var link = result.trim()
       result = ""
+      root.scanning = false
       root.open()
       if (link.length === 0) {
         root.view = "add"
         // 3 is a cancelled selection, which needs no complaint; anything else
         // means we looked and found nothing usable.
         root.formError = code === 3 ? ""
-          : "No two-factor QR code found on screen. Make sure it is visible, "
+          : "No two-factor QR code found. Make sure the code is on screen, "
           + "then try again."
         return
       }
@@ -535,6 +581,7 @@ Panel {
             width: parent.width
             title: "Two-factor"
             meta: {
+              if (root.scanning) return "Looking for a QR code..."
               if (root.notice.length > 0) return root.notice
               if (root.view === "manual") return "New account"
               if (root.view === "add") return "Add an account"
