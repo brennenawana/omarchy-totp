@@ -226,6 +226,7 @@ Item {
   property var _addQueue: []
   property bool _adding: false
   property bool _restoring: false
+  readonly property bool restoring: _restoring
 
   // Same name, same issuer and same secret means this account is already
   // stored. Two rows generating identical codes is pure confusion, and
@@ -257,7 +258,17 @@ Item {
     _drainAdds()
   }
 
-  function addMany(accounts) {
+  // `verb` names the operation in the completion message — "Restored" for an
+  // export file, "Imported" when the batch came from QR codes in an image.
+  function addMany(accounts, verb) {
+    // One named batch at a time: _batchVerb is read when the queue drains, so
+    // a second call here would relabel the in-flight completion message.
+    if (_restoring) {
+      actionFailed("Wait for the current import to finish")
+      return
+    }
+    _batchVerb = typeof verb === "string" && verb.length > 0 ? verb : "Restored"
+
     if (accounts.length === 0) {
       restoreFinished(false, "That export contained no accounts")
       return
@@ -280,7 +291,7 @@ Item {
 
     _restoreSkipped = skipped
     if (added === 0) {
-      restoreFinished(false, "Every account in that file is already here")
+      restoreFinished(false, "Every account found is already here")
       return
     }
 
@@ -290,6 +301,7 @@ Item {
   }
 
   property int _restoreSkipped: 0
+  property string _batchVerb: "Restored"
 
   function _drainAdds() {
     if (_adding) return
@@ -297,8 +309,8 @@ Item {
       if (_restoring) {
         _restoring = false
         restoreFinished(true, _restoreSkipped > 0
-          ? "Restored, skipping " + _restoreSkipped + " already here"
-          : "Restored")
+          ? _batchVerb + ", skipping " + _restoreSkipped + " already here"
+          : _batchVerb)
       }
       return
     }
