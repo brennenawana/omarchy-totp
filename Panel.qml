@@ -67,13 +67,46 @@ Panel {
   }
 
   readonly property string yubikeyStatusText: {
-    if (yubikey.status === "missing") return "Install yubikey-manager to use this."
-    if (yubikey.status === "no-key") return "Insert your YubiKey."
-    if (yubikey.status === "loading") return "Reading the key…"
-    if (yubikey.status === "error") return yubikey.error
-    if (yubikey.accounts.length === 0) return "No OATH accounts on this key."
+    if (!root.yubikeyEnabled) return "Off"
+    if (yubikey.status === "missing") return "Needs setup"
+    if (yubikey.status === "service") return "Service off"
+    if (yubikey.status === "no-key") return "No key"
+    if (yubikey.status === "locked") return "Locked"
+    if (yubikey.status === "loading") return "Reading…"
+    if (yubikey.status === "error") return "Error"
+    if (yubikey.accounts.length === 0) return "No accounts"
     return yubikey.accounts.length === 1 ? "1 account"
-                                             : yubikey.accounts.length + " accounts"
+                                         : yubikey.accounts.length + " accounts"
+  }
+
+  // The fix for whatever is blocking a first run, in the words the user needs,
+  // with the action that does it. Empty when there is nothing to fix — a
+  // YubiKey feature must not send anyone to a README to get started.
+  readonly property string yubikeyHint: {
+    if (!root.yubikeyEnabled) return ""
+    if (yubikey.status === "missing") return "yubikey-manager is needed to read the key."
+    if (yubikey.status === "service") return "The smart-card service (pcscd) isn't running."
+    if (yubikey.status === "no-key") return "Insert your YubiKey, then check again."
+    if (yubikey.status === "locked") return "Unlock the key's OATH app once on this machine."
+    if (yubikey.status === "error") return yubikey.error
+    return ""
+  }
+
+  readonly property string yubikeyAction: {
+    if (!root.yubikeyEnabled) return ""
+    if (yubikey.status === "missing") return "Install"
+    if (yubikey.status === "service") return "Start"
+    if (yubikey.status === "locked") return "Unlock"
+    if (yubikey.status === "no-key") return "Check again"
+    if (yubikey.status === "error") return "Check again"
+    return ""
+  }
+
+  function runYubiKeyAction() {
+    if (yubikey.status === "missing") yubikey.install()
+    else if (yubikey.status === "service") yubikey.startService()
+    else if (yubikey.status === "locked") yubikey.unlockKey()
+    else yubikey.refresh()
   }
 
   readonly property var addActions: [
@@ -1072,6 +1105,34 @@ Panel {
                   fontFamily: root.fontFamily
                   fontSize: Style.font.caption
                   onClicked: root.toggleYubiKey()
+                }
+              }
+
+              // Guided setup: when the first run is blocked, say what is
+              // missing and offer the one action that clears it.
+              Row {
+                visible: root.yubikeyHint.length > 0
+                width: parent.width
+                spacing: Style.space(8)
+
+                Text {
+                  width: parent.width - fixButton.width - Style.space(8)
+                  text: root.yubikeyHint
+                  textFormat: Text.PlainText
+                  wrapMode: Text.WordWrap
+                  color: root.dim
+                  font.family: root.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+
+                Button {
+                  id: fixButton
+                  text: root.yubikeyAction
+                  bordered: true
+                  foreground: root.foreground
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.runYubiKeyAction()
                 }
               }
 

@@ -90,7 +90,10 @@ key; nothing is copied into the keyring, and nothing here can be exported.
 - The countdown assumes the usual 30-second period, which `ykman` does not
   report.
 
-It needs `yubikey-manager` and a running `pcscd`:
+It needs `yubikey-manager` and a running `pcscd`. The panel checks for both and
+offers the fix where the problem shows — install yubikey-manager, start the
+service, unlock the key, or check again for a key — so these commands are only
+for doing it by hand:
 
 ```
 sudo pacman -S --needed yubikey-manager
