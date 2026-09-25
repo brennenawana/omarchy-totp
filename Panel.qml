@@ -54,6 +54,28 @@ Panel {
     return out
   }
 
+  // Off until the "yubikey" setting is turned on. When it is off, YubiKey.qml
+  // spawns no process at all — see the note there.
+  readonly property bool yubikeyEnabled: setting("yubikey", false) === true
+
+  readonly property var visibleYubiKey: {
+    var out = []
+    for (var i = 0; i < yubikey.accounts.length; i++) {
+      if (Store.matches(yubikey.accounts[i], root.query)) out.push(yubikey.accounts[i])
+    }
+    return out
+  }
+
+  readonly property string yubikeyStatusText: {
+    if (yubikey.status === "missing") return "Install yubikey-manager to use this."
+    if (yubikey.status === "no-key") return "Insert your YubiKey."
+    if (yubikey.status === "loading") return "Reading the key…"
+    if (yubikey.status === "error") return yubikey.error
+    if (yubikey.accounts.length === 0) return "No OATH accounts on this key."
+    return yubikey.accounts.length === 1 ? "1 account"
+                                             : yubikey.accounts.length + " accounts"
+  }
+
   readonly property var addActions: [
     { key: "scan", label: "Scan a QR code on screen" },
     { key: "image", label: "Import QR codes from an image" },
@@ -92,6 +114,25 @@ Panel {
   function flash(message) {
     root.notice = message
     noticeTimer.restart()
+  }
+
+  // Writes this panel's inline settings back to shell.json. The shell owns the
+  // file, so the write goes through it; the local copy is updated at once so
+  // the UI reacts without waiting for a reload.
+  function persist(values) {
+    var entry = { id: root.moduleName }
+    var current = root.settings || ({})
+    for (var existing in current) if (existing !== "id") entry[existing] = current[existing]
+    for (var key in values) entry[key] = values[key]
+
+    root.settings = entry
+    if (root.bar && root.bar.shell && typeof root.bar.shell.updateEntryInline === "function")
+      root.bar.shell.updateEntryInline(root.moduleName, entry)
+  }
+
+  // The opt-in for the YubiKey source. Nothing reads the key until this is on.
+  function toggleYubiKey() {
+    persist({ yubikey: !root.yubikeyEnabled })
   }
 
   function copyCode(code) {
@@ -376,10 +417,13 @@ Panel {
       root.scanning = scanner.running || quickScanner.running || imageScanner.running
       searchField.text = ""
       vault.reload()
+      if (root.yubikeyEnabled) yubikey.refresh()
       Qt.callLater(function() { keyCatcher.forceActiveFocus() })
     } else {
       // Decrypted secrets do not outlive the popup.
       vault.forgetSecrets()
+      // Nor do the codes read off the key.
+      yubikey.forget()
       secretField.text = ""
       linkField.text = ""
       exportPassField.text = ""
@@ -416,6 +460,13 @@ Panel {
         root.formError = message
       }
     }
+  }
+
+  // A second, read-only source of codes. Inert unless the setting is on: it
+  // spawns no process and stores nothing of its own.
+  YubiKey {
+    id: yubikey
+    enabled: root.yubikeyEnabled
   }
 
   Timer {
@@ -682,6 +733,12 @@ Panel {
               if (root.view === "image") return "Import from an image"
               if (vault.error.length > 0) return "Keyring unavailable"
               if (!vault.secretsLoaded && vault.records.length > 0) return "Unlocking…"
+              // With no vault accounts but a key present, the count below would
+              // read "0 accounts" beside a full YubiKey list.
+              if (vault.records.length === 0 && root.visibleYubiKey.length > 0) {
+                return root.visibleYubiKey.length === 1 ? "1 key account"
+                                                        : root.visibleYubiKey.length + " key accounts"
+              }
               return vault.records.length === 1 ? "1 account"
                                                 : vault.records.length + " accounts"
             }
@@ -714,7 +771,7 @@ Panel {
               TextField {
                 id: searchField
                 width: parent.width - addButton.width - Style.space(8)
-                visible: vault.records.length > 1
+                visible: vault.records.length + yubikey.accounts.length > 1
                 placeholderText: "Search"
                 foreground: root.foreground
                 font.family: root.fontFamily
@@ -756,7 +813,7 @@ Panel {
             }
 
             Text {
-              visible: vault.records.length === 0
+              visible: vault.records.length === 0 && !yubikey.showing
               width: parent.width
               text: "No accounts yet. Add one by scanning the QR code on a "
                   + "site's two-factor setup page."
@@ -955,6 +1012,173 @@ Panel {
                     purgeTimer.restart()
                   }
                 }
+              }
+            }
+
+            // ------------------------------------------- yubikey source
+            // A second, read-only source. Nothing here is added to the vault,
+            // exported, or removed — the accounts live on the key and are only
+            // read from it. Rendered only when the setting is on.
+
+            Column {
+              width: parent.width
+              spacing: Style.space(8)
+
+              PanelSeparator { foreground: root.foreground }
+
+              Item {
+                width: parent.width
+                implicitHeight: Math.max(headerRow.implicitHeight, toggleButton.implicitHeight)
+
+                Row {
+                  id: headerRow
+                  anchors.left: parent.left
+                  anchors.verticalCenter: parent.verticalCenter
+                  width: parent.width - toggleButton.width - Style.space(8)
+                  spacing: Style.space(6)
+
+                  // \uf0bc is a Nerd Font shield; the key is a distinct source,
+                  // so it gets a heading instead of blending into the list.
+                  Text {
+                    text: "\uf0bc YubiKey"
+                    textFormat: Text.PlainText
+                    color: root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.bodySmall
+                  }
+
+                  Text {
+                    width: parent.width - Style.space(70)
+                    text: root.yubikeyEnabled ? root.yubikeyStatusText : "Off"
+                    textFormat: Text.PlainText
+                    elide: Text.ElideRight
+                    color: yubikey.status === "error" ? root.urgent : root.dim
+                    font.family: root.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                // The opt-in. Turning it on is the only thing that ever starts
+                // a ykman call; off is the default and the quiet state.
+                Button {
+                  id: toggleButton
+                  anchors.right: parent.right
+                  anchors.verticalCenter: parent.verticalCenter
+                  text: root.yubikeyEnabled ? "Turn off" : "Turn on"
+                  tooltipText: root.yubikeyEnabled
+                    ? "Stop reading codes from the key"
+                    : "Read codes from OATH accounts on an inserted YubiKey"
+                  foreground: root.dim
+                  fontFamily: root.fontFamily
+                  fontSize: Style.font.caption
+                  onClicked: root.toggleYubiKey()
+                }
+              }
+
+              Repeater {
+                model: root.visibleYubiKey
+
+                Item {
+                  id: ykRow
+                  required property var modelData
+                  required property int index
+                  width: column.width
+                  implicitHeight: ykBody.implicitHeight + Style.space(10)
+
+                  readonly property string code: yubikey.codeFor(modelData)
+                  readonly property bool timeBased: modelData.type !== "HOTP"
+                  readonly property int remaining: Totp.secondsRemaining(modelData.period, root.now)
+                  readonly property bool expiring: remaining <= 5
+
+                  MouseArea {
+                    id: ykMouse
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: Qt.PointingHandCursor
+                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                    onClicked: function(mouse) {
+                      if (!ykRow.timeBased) return
+                      if (ykRow.code.length === 0) {
+                        // Nothing read yet — ask the key. This is where a
+                        // credential that needs a touch prompts for one.
+                        yubikey.fetchCode(ykRow.modelData.name)
+                        root.flash("Touch the key")
+                        return
+                      }
+                      if (mouse.button === Qt.RightButton) root.typeCode(ykRow.code)
+                      else root.copyCode(ykRow.code)
+                    }
+                  }
+
+                  Rectangle {
+                    anchors.fill: parent
+                    radius: Style.cornerRadius
+                    color: ykMouse.containsMouse ? Util.alpha(root.foreground, 0.07)
+                                                 : "transparent"
+                  }
+
+                  Column {
+                    id: ykBody
+                    width: parent.width
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(1)
+
+                    Text {
+                      width: parent.width
+                      // Untrusted: the name came off the key.
+                      text: ykRow.modelData.issuer.length > 0
+                            && ykRow.modelData.issuer !== ykRow.modelData.label
+                          ? ykRow.modelData.issuer + " · " + ykRow.modelData.label
+                          : ykRow.modelData.label
+                      textFormat: Text.PlainText
+                      elide: Text.ElideRight
+                      color: root.dim
+                      font.family: root.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                    }
+
+                    Row {
+                      width: parent.width
+                      spacing: Style.space(8)
+
+                      Text {
+                        text: !ykRow.timeBased
+                          ? "Counter-based, not generated"
+                          : ykRow.code.length > 0
+                            ? Store.groupCode(ykRow.code)
+                            : "Touch the key to read"
+                        textFormat: Text.PlainText
+                        color: ykRow.timeBased && ykRow.code.length > 0
+                          ? root.foreground : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: ykRow.timeBased && ykRow.code.length > 0
+                          ? Style.font.displayLarge : Style.font.bodySmall
+                      }
+
+                      Text {
+                        anchors.verticalCenter: parent.verticalCenter
+                        visible: ykRow.timeBased && ykRow.code.length > 0
+                        text: ykRow.remaining + "s"
+                        textFormat: Text.PlainText
+                        color: ykRow.expiring ? root.urgent : root.dim
+                        font.family: root.fontFamily
+                        font.pixelSize: Style.font.bodySmall
+                      }
+                    }
+                  }
+                }
+              }
+
+              Text {
+                visible: root.visibleYubiKey.length > 0
+                width: parent.width
+                text: "Read straight from the key. Nothing here is stored or "
+                    + "exported, and the countdown assumes the usual 30 seconds."
+                textFormat: Text.PlainText
+                wrapMode: Text.WordWrap
+                color: root.dim
+                font.family: root.fontFamily
+                font.pixelSize: Style.font.caption
               }
             }
           }
