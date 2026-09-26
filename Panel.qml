@@ -102,11 +102,32 @@ Panel {
     return ""
   }
 
+  // Where a fix opens a terminal, the popup has to close first: while it is up
+  // it holds the keyboard, so the terminal would come up behind it unfocused.
+  // Same hand-off typeCode() does before it types.
+  property string deferredYubiAction: ""
+
   function runYubiKeyAction() {
-    if (yubikey.status === "missing") yubikey.install()
-    else if (yubikey.status === "service") yubikey.startService()
-    else if (yubikey.status === "locked") yubikey.unlockKey()
-    else yubikey.refresh()
+    if (yubikey.status === "missing" || yubikey.status === "locked") {
+      deferredYubiAction = yubikey.status
+      root.close()
+      yubiActionDelay.restart()
+      return
+    }
+    if (yubikey.status === "service") {
+      // Starting the socket opens no window of its own, so keep the popup and
+      // let the re-read fill it in.
+      yubikey.startService()
+      return
+    }
+    yubikey.refresh()
+  }
+
+  function performDeferredYubiAction() {
+    var action = deferredYubiAction
+    deferredYubiAction = ""
+    if (action === "missing") yubikey.install()
+    else if (action === "locked") yubikey.unlockKey()
   }
 
   readonly property var addActions: [
@@ -531,6 +552,14 @@ Panel {
       typer.stdinEnabled = true
       typer.running = true
     }
+  }
+
+  // Runs a terminal-opening fix once the popup has closed and the compositor
+  // has handed the keyboard to whatever comes up.
+  Timer {
+    id: yubiActionDelay
+    interval: 220
+    onTriggered: root.performDeferredYubiAction()
   }
 
   // Both of these take the code on stdin rather than as an argument. A TOTP
